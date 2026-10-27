@@ -24,6 +24,13 @@
 #include	"sndfile.h"
 #include	"common.h"
 
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+#endif
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 static sf_count_t alaw_read_alaw2s (SF_PRIVATE *psf, short *ptr, sf_count_t len) ;
 static sf_count_t alaw_read_alaw2i (SF_PRIVATE *psf, int *ptr, sf_count_t len) ;
 static sf_count_t alaw_read_alaw2f (SF_PRIVATE *psf, float *ptr, sf_count_t len) ;
@@ -295,17 +302,80 @@ alaw2s_array (unsigned char *buffer, int count, short *ptr)
 {	for (int i = 0 ; i < count ; i++)
 		ptr [i] = alaw_decode [(int) buffer [i]] ;
 } /* alaw2s_array */
+static int alaw_dec32_ready = 0 ;
+static int alaw_dec32 [256] ;
+static int alaw_enc32 [2049] ;
+
+static inline void
+alaw_prep32 (void)
+{	int k ;
+	if (alaw_dec32_ready) return ;
+	for (k = 0 ; k < 256 ; k++)
+		alaw_dec32 [k] = (int) alaw_decode [k] ;
+	for (k = 0 ; k < 2049 ; k++)
+		alaw_enc32 [k] = (int) alaw_encode [k] ;
+	alaw_dec32_ready = 1 ;
+} /* alaw_prep32 */
+
 
 static inline void
 alaw2i_array (unsigned char *buffer, int count, int *ptr)
-{	for (int i = 0 ; i < count ; i++)
+{
+#if defined(__ARM_FEATURE_SVE)
+	{	int	i = 0 ;
+		int	vl8 = (int) svcntw () ;
+		svbool_t pgb  = svptrue_b8 () ;
+		svbool_t pg16 = svptrue_b16 () ;
+		svbool_t pg32 = svptrue_b32 () ;
+
+		alaw_prep32 () ;
+
+		for ( ; i + vl8 <= count ; i += vl8)
+		{	svuint8_t  b   = svld1_u8 (pgb, buffer + i) ;
+			svuint16_t w   = svunpklo_u16 (b) ;
+			svuint32_t idx = svunpklo_u32 (w) ;
+			svint32_t  d   = svld1_gather_u32index_s32 (pg32, alaw_dec32, idx) ;
+			svst1_s32 (pg32, ptr + i, svlsl_n_s32_x (pg32, d, 16)) ;
+			} ;
+		for ( ; i < count ; i++)
+			ptr [i] = ((uint32_t) alaw_decode [(int) buffer [i]]) << 16 ;
+		}
+	return ;
+#else
+	for (int i = 0 ; i < count ; i++)
 		ptr [i] = ((uint32_t) alaw_decode [(int) buffer [i]]) << 16 ;
+#endif
 } /* alaw2i_array */
 
 static inline void
 alaw2f_array (unsigned char *buffer, int count, float *ptr, float normfact)
-{	for (int i = 0 ; i < count ; i++)
+{
+#if defined(__ARM_FEATURE_SVE)
+	{	int	i = 0 ;
+		int	vl8 = (int) svcntw () ;
+		svfloat32_t nf = svdup_f32 (normfact) ;
+		svbool_t pgb  = svptrue_b8 () ;
+		svbool_t pg16 = svptrue_b16 () ;
+		svbool_t pg32 = svptrue_b32 () ;
+
+		alaw_prep32 () ;
+
+		for ( ; i + vl8 <= count ; i += vl8)
+		{	svuint8_t  b   = svld1_u8 (pgb, buffer + i) ;
+			svuint16_t w   = svunpklo_u16 (b) ;
+			svuint32_t idx = svunpklo_u32 (w) ;
+			svint32_t  d   = svld1_gather_u32index_s32 (pg32, alaw_dec32, idx) ;
+			svfloat32_t f  = svmul_f32_x (pg32, svcvt_f32_s32_x (pg32, d), nf) ;
+			svst1_f32 (pg32, ptr + i, f) ;
+			} ;
+		for ( ; i < count ; i++)
+			ptr [i] = normfact * alaw_decode [(int) buffer [i]] ;
+		}
+	return ;
+#else
+	for (int i = 0 ; i < count ; i++)
 		ptr [i] = normfact * alaw_decode [(int) buffer [i]] ;
+#endif
 } /* alaw2f_array */
 
 static inline void
@@ -316,12 +386,42 @@ alaw2d_array (unsigned char *buffer, int count, double *ptr, double normfact)
 
 static inline void
 s2alaw_array (const short *ptr, int count, unsigned char *buffer)
-{	for (int i = 0 ; i < count ; i++)
+{
+#if defined(__ARM_FEATURE_SVE)
+	{	int	i = 0 ;
+		int	vl = (int) svcntw () ;
+		svbool_t pg32 = svptrue_b32 () ;
+		svbool_t pg8  = svwhilelt_b8 (0, vl) ;
+
+		alaw_prep32 () ;
+
+		for ( ; i + vl <= count ; i += vl)
+		{	svint32_t v    = svld1sh_s32 (pg32, ptr + i) ;	/* short -> s32 符号扩展 */
+			svint32_t mag  = svabs_s32_x (pg32, v) ;	/* |v| */
+			svint32_t idx  = svasr_n_s32_x (pg32, mag, 4) ;	/* |v| / 16（abs 后算术右移==除以16） */
+			svint32_t val  = svld1_gather_u32index_s32 (pg32, alaw_enc32, svreinterpret_u32_s32 (idx)) ;	/* 单 gather */
+			svbool_t   pn  = svcmplt_n_s32 (pg32, v, 0) ;
+			svint32_t  out = svand_s32_x (pg32, val, svreinterpret_s32_u32 (svsel_u32 (pn, svdup_n_u32 (0x7F), svdup_n_u32 (0xFF)))) ;
+			svint16_t  H = svuzp1_s16 (svreinterpret_s16_s32 (out), svreinterpret_s16_s32 (out)) ;
+			svint8_t   B = svuzp1_s8 (svreinterpret_s8_s16 (H), svreinterpret_s8_s16 (H)) ;
+			svst1_s8 (pg8, (int8_t*) buffer + i, B) ;
+			} ;
+		for ( ; i < count ; i++)
+		{	if (ptr [i] >= 0)
+				buffer [i] = alaw_encode [ptr [i] / 16] ;
+			else
+				buffer [i] = 0x7F & alaw_encode [ptr [i] / -16] ;
+			} ;
+		}
+	return ;
+#else
+	for (int i = 0 ; i < count ; i++)
 	{	if (ptr [i] >= 0)
 			buffer [i] = alaw_encode [ptr [i] / 16] ;
 		else
 			buffer [i] = 0x7F & alaw_encode [ptr [i] / -16] ;
 		} ;
+#endif
 } /* s2alaw_array */
 
 static inline void
@@ -338,12 +438,47 @@ i2alaw_array (const int *ptr, int count, unsigned char *buffer)
 
 static inline void
 f2alaw_array (const float *ptr, int count, unsigned char *buffer, float normfact)
-{	for (int i = 0 ; i < count ; i++)
+{
+#if defined(__ARM_FEATURE_SVE)
+	{	int	i = 0 ;
+		int	vl = (int) svcntw () ;
+		svfloat32_t nf = svdup_f32 (normfact) ;
+		svbool_t pg32 = svptrue_b32 () ;
+		svbool_t pg8  = svwhilelt_b8 (0, vl) ;
+
+		alaw_prep32 () ;
+
+		for ( ; i + vl <= count ; i += vl)
+		{	svfloat32_t f   = svld1_f32 (pg32, ptr + i) ;
+			svfloat32_t r   = svrintn_f32_x (pg32, svmul_f32_x (pg32, f, nf)) ;
+			svint32_t   o   = svcvt_s32_f32_x (pg32, r) ;	/* = lrintf */
+			svint32_t   idx = svabs_s32_x (pg32, o) ;
+			svint32_t   val = svld1_gather_u32index_s32 (pg32, alaw_enc32, svreinterpret_u32_s32 (idx)) ;
+			/* 符号判定与标量 "ptr[i] >= 0" 一致：-0.0 (bit31=1) 归正分支。
+			   用严格 "f < 0" 谓词而非 bit31（否则 -0.0 被误判为负，&0x7F 翻转字节）。 */
+			svbool_t    pneg = svcmplt_n_f32 (pg32, f, 0.0f) ;
+			svuint32_t  nm   = svsel_u32 (pneg, svdup_n_u32 (0x7F), svdup_n_u32 (0xFF)) ;
+			svint32_t   out = svand_s32_x (pg32, val, svreinterpret_s32_u32 (nm)) ;
+			svint16_t   H = svuzp1_s16 (svreinterpret_s16_s32 (out), svreinterpret_s16_s32 (out)) ;
+			svint8_t    B = svuzp1_s8 (svreinterpret_s8_s16 (H), svreinterpret_s8_s16 (H)) ;
+			svst1_s8 (pg8, (int8_t*) buffer + i, B) ;
+			} ;
+		for ( ; i < count ; i++)
+		{	if (ptr [i] >= 0)
+				buffer [i] = alaw_encode [psf_lrintf (normfact * ptr [i])] ;
+			else
+				buffer [i] = 0x7F & alaw_encode [- psf_lrintf (normfact * ptr [i])] ;
+			} ;
+		}
+	return ;
+#else
+	for (int i = 0 ; i < count ; i++)
 	{	if (ptr [i] >= 0)
 			buffer [i] = alaw_encode [psf_lrintf (normfact * ptr [i])] ;
 		else
 			buffer [i] = 0x7F & alaw_encode [- psf_lrintf (normfact * ptr [i])] ;
 		} ;
+#endif
 } /* f2alaw_array */
 
 static inline void
