@@ -401,13 +401,29 @@ uc2f_array	(const unsigned char *src, int count, float *dest, float normfact)
 
 static inline void
 les2f_array (const short *src, int count, float *dest, float normfact)
-{	short	value ;
-
+{
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_SVE) && defined(CPU_IS_LITTLE_ENDIAN)
+	float32x4_t nf = vdupq_n_f32 (normfact) ;
+	int  i = 0 ;
+	for ( ; i + 8 <= count ; i += 8)
+	{	int16x8_t s = vld1q_s16 (src + i) ;
+		int32x4_t lo = vmovl_s16 (vget_low_s16 (s)) ;
+		int32x4_t hi = vmovl_s16 (vget_high_s16 (s)) ;
+		float32x4_t flo = vmulq_f32 (vcvtq_f32_s32 (lo), nf) ;
+		float32x4_t fhi = vmulq_f32 (vcvtq_f32_s32 (hi), nf) ;
+		vst1q_f32 (dest + i,     flo) ;
+		vst1q_f32 (dest + i + 4, fhi) ;
+	}
+	for ( ; i < count ; i++)
+		dest [i] = normfact * src [i] ;
+#else
+	short	value ;
 	for (int i = 0 ; i < count ; i++)
 	{	value = src [i] ;
 		value = LE2H_16 (value) ;
 		dest [i] = ((float) value) * normfact ;
 		} ;
+endif
 } /* les2f_array */
 
 static inline void
