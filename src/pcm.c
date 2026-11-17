@@ -423,7 +423,7 @@ les2f_array (const short *src, int count, float *dest, float normfact)
 		value = LE2H_16 (value) ;
 		dest [i] = ((float) value) * normfact ;
 		} ;
-endif
+#endif
 } /* les2f_array */
 
 static inline void
